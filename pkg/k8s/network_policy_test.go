@@ -157,7 +157,7 @@ func TestParseNetworkPolicyIngress(t *testing.T) {
 	ingressL4Policy, err := repo.ResolveL4IngressPolicy(&ctx)
 	require.NotNil(t, ingressL4Policy)
 	require.NoError(t, err)
-	require.EqualValues(t, policy.L4PolicyMap{
+	expected := policy.NewL4PolicyMap(map[string]*policy.L4Filter{
 		"80/TCP": {
 			Port: 80, Protocol: api.ProtoTCP, U8Proto: 6,
 			L7Parser:            policy.ParserTypeNone,
@@ -172,7 +172,8 @@ func TestParseNetworkPolicyIngress(t *testing.T) {
 				)},
 			},
 		},
-	}, ingressL4Policy)
+	})
+	require.True(t, ingressL4Policy.Equals(t, expected), ingressL4Policy.Diff(t, expected))
 	ingressL4Policy.Detach(repo.GetSelectorCache())
 
 	ctx.To = labels.LabelArray{
@@ -486,7 +487,7 @@ func TestParseNetworkPolicyEgress(t *testing.T) {
 	egressL4Policy, err := repo.ResolveL4EgressPolicy(&ctx)
 	require.NotNil(t, egressL4Policy)
 	require.NoError(t, err)
-	require.EqualValues(t, policy.L4PolicyMap{
+	expected := policy.NewL4PolicyMap(map[string]*policy.L4Filter{
 		"80/TCP": {
 			Port: 80, Protocol: api.ProtoTCP, U8Proto: 6,
 			L7Parser:            policy.ParserTypeNone,
@@ -496,7 +497,8 @@ func TestParseNetworkPolicyEgress(t *testing.T) {
 				cachedEPSelector: {rules[0].Labels},
 			},
 		},
-	}, egressL4Policy)
+	})
+	require.True(t, egressL4Policy.Equals(t, expected), egressL4Policy.Diff(t, expected))
 	egressL4Policy.Detach(repo.GetSelectorCache())
 
 	ctx.From = labels.LabelArray{

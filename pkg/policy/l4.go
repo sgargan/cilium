@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
+	"testing"
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/container/bitlpm"
 	"github.com/cilium/cilium/pkg/iana"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
@@ -23,6 +26,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
+	"github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
@@ -496,6 +500,30 @@ func (l4 *L4Filter) GetIngress() bool {
 // GetPort returns the port at which the L4Filter applies as a uint16.
 func (l4 *L4Filter) GetPort() uint16 {
 	return l4.Port
+}
+
+// Equals returns true if two L4Filters are equal
+func (l4 *L4Filter) Equals(_ *testing.T, bL4 *L4Filter) bool {
+	if l4.Port == bL4.Port &&
+		l4.EndPort == bL4.EndPort &&
+		l4.PortName == bL4.PortName &&
+		l4.Protocol == bL4.Protocol &&
+		l4.wildcard == bL4.wildcard &&
+		l4.L7Parser == bL4.L7Parser {
+
+		if len(l4.PerSelectorPolicies) != len(bL4.PerSelectorPolicies) {
+			return false
+		}
+		for k, v := range l4.PerSelectorPolicies {
+			bV, ok := bL4.PerSelectorPolicies[k]
+			if !ok || !bV.Equal(v) {
+				return false
+			}
+
+		}
+		return true
+	}
+	return false
 }
 
 // ChangeState allows caller to revert changes made by (multiple) toMapState call(s)
@@ -1061,10 +1089,9 @@ func addL4Filter(policyCtx PolicyContext,
 	filterToMerge *L4Filter,
 	ruleLabels labels.LabelArray) error {
 
-	key := p.Port + "/" + string(proto)
-	existingFilter, ok := resMap[key]
-	if !ok {
-		resMap[key] = filterToMerge
+	existingFilter := resMap.ExactLookup(p.Port, uint16(p.EndPort), string(proto))
+	if existingFilter == nil {
+		resMap.Upsert(p.Port, uint16(p.EndPort), string(proto), filterToMerge)
 		return nil
 	}
 
@@ -1084,13 +1111,211 @@ func addL4Filter(policyCtx PolicyContext,
 		}
 	}
 
-	resMap[key] = existingFilter
+	resMap.Upsert(p.Port, uint16(p.EndPort), string(proto), existingFilter)
 	return nil
 }
 
-// L4PolicyMap is a list of L4 filters indexable by protocol/port
-// key format: "port/proto"
-type L4PolicyMap map[string]*L4Filter
+// L4PolicyMap is a list of L4 filters indexable by port/endport/protocol
+type L4PolicyMap interface {
+	Upsert(port string, endPort uint16, protocol string, l4 *L4Filter)
+	Delete(port string, endPort uint16, protocol string)
+	ExactLookup(port string, endPort uint16, protocol string) *L4Filter
+	Lookup(port string, protocol string) *L4Filter
+	Detach(selectorCache *SelectorCache)
+	IngressCoversContext(ctx *SearchContext) api.Decision
+	EgressCoversContext(ctx *SearchContext) api.Decision
+	ForEach(func(l4 *L4Filter) bool)
+	Equals(t *testing.T, bMap L4PolicyMap) bool
+	Diff(t *testing.T, expectedMap L4PolicyMap) string
+	Len() int
+}
+
+// NewL4PolicyMap creates an new L4PolicMap. The initMap argument
+// does not support ranges.
+func NewL4PolicyMap(initMap map[string]*L4Filter) L4PolicyMap {
+	l4M := &l4PolicyMap{
+		namedPortMap: make(map[string]*L4Filter),
+		rangePortMap: bitlpm.NewUintTrie[uint32, *L4Filter](),
+	}
+	for k, v := range initMap {
+		portProtoSlice := strings.Split(k, "/")
+		if len(portProtoSlice) < 2 {
+			continue
+		}
+		l4M.Upsert(portProtoSlice[0], 0, portProtoSlice[1], v)
+	}
+	return l4M
+}
+
+// l4PolicyMap is the implementation of L4PolicyMap
+type l4PolicyMap struct {
+	namedPortMap map[string]*L4Filter
+	rangePortMap *bitlpm.UintTrie[uint32, *L4Filter]
+	// rangeMapLen must be tracked separately from
+	// rangePortMap as L4Filters are split up when
+	// the port range is long enough. This does not
+	// represent additional entries only the vagaries
+	// of indexing by range.
+	rangeMapLen int
+}
+
+func parsePortProtocol(port, protocol string) (uint16, uint8) {
+	// These string values have been validated many times
+	// over at this point.
+	prt, _ := strconv.ParseUint(port, 10, 16)
+	proto, _ := u8proto.ParseProtocol(protocol)
+	return uint16(prt), uint8(proto)
+}
+
+func makePolicyMapKey(port, mask uint16, proto uint8) uint32 {
+	return (uint32(proto) << 16) | uint32(port&mask)
+}
+
+// Upsert L4Filter adds an L4Filter indexed by protocol/port-endPort.
+func (l4M *l4PolicyMap) Upsert(port string, endPort uint16, protocol string, l4 *L4Filter) {
+	if iana.IsSvcName(port) {
+		l4M.namedPortMap[port+"/"+protocol] = l4
+		return
+	}
+
+	portU, protoU := parsePortProtocol(port, protocol)
+	var upsertHappened bool
+	for _, mp := range PortRangeToMaskedPorts(portU, endPort) {
+		k := makePolicyMapKey(mp.port, mp.mask, protoU)
+		prefix := 32 - types.MaskToPrefix(mp.mask)
+		_, ok := l4M.rangePortMap.ExactLookup(prefix, k)
+		l4M.rangePortMap.Upsert(prefix, k, l4)
+		if !upsertHappened && !ok {
+			l4M.rangeMapLen += 1
+			upsertHappened = true
+		}
+	}
+}
+
+// Delete delets an L4Filter from the index by protocol/port-endPort
+func (l4M *l4PolicyMap) Delete(port string, endPort uint16, protocol string) {
+	if iana.IsSvcName(port) {
+		delete(l4M.namedPortMap, port+"/"+protocol)
+		return
+	}
+
+	portU, protoU := parsePortProtocol(port, protocol)
+	var deleteHappened bool
+	for _, mp := range PortRangeToMaskedPorts(portU, endPort) {
+		k := makePolicyMapKey(mp.port, mp.mask, protoU)
+		l4M.rangePortMap.Delete(32-types.MaskToPrefix(mp.mask), k)
+		if !deleteHappened {
+			l4M.rangeMapLen -= 1
+			deleteHappened = true
+		}
+	}
+}
+
+// ExactLookup looks up an L4Filter by protocol/port-endPort and looks for an exact match.
+func (l4M *l4PolicyMap) ExactLookup(port string, endPort uint16, protocol string) *L4Filter {
+	if iana.IsSvcName(port) {
+		return l4M.namedPortMap[port+"/"+protocol]
+	}
+	portU, protoU := parsePortProtocol(port, protocol)
+	for _, mp := range PortRangeToMaskedPorts(portU, endPort) {
+		k := makePolicyMapKey(mp.port, mp.mask, protoU)
+		l4, ok := l4M.rangePortMap.ExactLookup(32-types.MaskToPrefix(mp.mask), k)
+		if ok {
+			return l4
+		}
+	}
+	return nil
+}
+
+// Lookup looks up an L4Filter by protocol/port that contains the port and protocol
+// by longest prefix match.
+func (l4M *l4PolicyMap) Lookup(port string, protocol string) *L4Filter {
+	if iana.IsSvcName(port) {
+		return l4M.namedPortMap[port+"/"+protocol]
+	}
+	portU, protoU := parsePortProtocol(port, protocol)
+	filter, ok := l4M.rangePortMap.LongestPrefixMatch(makePolicyMapKey(portU, 0xffff, protoU))
+	if !ok {
+		return nil
+	}
+	return filter
+}
+
+// ForEach iterates over all L4Filters in the l4PolicyMap.
+func (l4M *l4PolicyMap) ForEach(fn func(l4 *L4Filter) bool) {
+	for _, f := range l4M.namedPortMap {
+		fn(f)
+	}
+	l4PortProtoKeys := make(map[string]struct{})
+	l4M.rangePortMap.ForEach(func(prefix uint, key uint32, value *L4Filter) bool {
+		portProtoKey := fmt.Sprintf("%d-%d/%d", value.Port, value.EndPort, uint8(value.U8Proto))
+		// We check for redundant L4Filters, because we split them apart in the index.
+		if _, ok := l4PortProtoKeys[portProtoKey]; !ok {
+			fn(value)
+			l4PortProtoKeys[portProtoKey] = struct{}{}
+		}
+		return true
+	})
+}
+
+// Equals returns true if both L4PolicyMaps are equal.
+func (l4M *l4PolicyMap) Equals(_ *testing.T, bMap L4PolicyMap) bool {
+	if l4M.Len() != bMap.Len() {
+		return false
+	}
+	equal := true
+	l4M.ForEach(func(l4 *L4Filter) bool {
+		port := l4.PortName
+		if len(port) == 0 {
+			port = fmt.Sprintf("%d", l4.Port)
+		}
+		l4B := bMap.ExactLookup(port, l4.EndPort, string(l4.Protocol))
+		equal = l4.Equals(nil, l4B)
+		return equal
+	})
+	return equal
+}
+
+// Diff returns the difference between to L4PolicyMaps.
+func (l4M *l4PolicyMap) Diff(_ *testing.T, expected L4PolicyMap) (res string) {
+	res += "Missing (-), Unexpected (+):\n"
+	expected.ForEach(func(eV *L4Filter) bool {
+		port := eV.PortName
+		if len(port) == 0 {
+			port = fmt.Sprintf("%d", eV.Port)
+		}
+		oV := l4M.ExactLookup(port, eV.Port, string(eV.Protocol))
+		if oV != nil {
+			if !eV.Equals(nil, oV) {
+				res += "- " + eV.String() + "\n"
+				res += "+ " + oV.String() + "\n"
+			}
+		} else {
+			res += "- " + eV.String() + "\n"
+		}
+		return true
+	})
+	l4M.ForEach(func(oV *L4Filter) bool {
+		port := oV.PortName
+		if len(port) == 0 {
+			port = fmt.Sprintf("%d", oV.Port)
+		}
+		eV := expected.ExactLookup(port, oV.Port, string(oV.Protocol))
+		if eV == nil {
+			res += "+ " + oV.String() + "\n"
+		}
+		return true
+	})
+	return
+}
+
+// Len returns the number of entries in the map.
+func (l4M *l4PolicyMap) Len() int {
+	if l4M == nil {
+		return 0
+	}
+	return len(l4M.namedPortMap) + l4M.rangeMapLen
+}
 
 type policyFeatures uint8
 
@@ -1118,7 +1343,7 @@ type L4DirectionPolicy struct {
 
 func newL4DirectionPolicy() L4DirectionPolicy {
 	return L4DirectionPolicy{
-		PortRules: L4PolicyMap{},
+		PortRules: NewL4PolicyMap(nil),
 	}
 }
 
@@ -1130,10 +1355,11 @@ func (l4 L4DirectionPolicy) Detach(selectorCache *SelectorCache) {
 }
 
 // detach is used directly from tracing and testing functions
-func (l4 L4PolicyMap) Detach(selectorCache *SelectorCache) {
-	for _, f := range l4 {
-		f.detach(selectorCache)
-	}
+func (l4M *l4PolicyMap) Detach(selectorCache *SelectorCache) {
+	l4M.ForEach(func(l4 *L4Filter) bool {
+		l4.detach(selectorCache)
+		return true
+	})
 }
 
 // Attach makes all the L4Filters to point back to the L4Policy that contains them.
@@ -1142,10 +1368,11 @@ func (l4 L4PolicyMap) Detach(selectorCache *SelectorCache) {
 func (l4 *L4DirectionPolicy) attach(ctx PolicyContext, l4Policy *L4Policy) redirectTypes {
 	var redirectTypes redirectTypes
 	var features policyFeatures
-	for _, f := range l4.PortRules {
+	l4.PortRules.ForEach(func(f *L4Filter) bool {
 		features |= f.attach(ctx, l4Policy)
 		redirectTypes |= f.redirectType()
-	}
+		return true
+	})
 	l4.features = features
 	return redirectTypes
 }
@@ -1163,14 +1390,14 @@ func (l4 *L4DirectionPolicy) attach(ctx PolicyContext, l4Policy *L4Policy) redir
 // Otherwise, returns api.Allowed.
 //
 // Note: Only used for policy tracing
-func (l4 L4PolicyMap) containsAllL3L4(labels labels.LabelArray, ports []*models.Port) api.Decision {
-	if len(l4) == 0 {
+func (l4M *l4PolicyMap) containsAllL3L4(labels labels.LabelArray, ports []*models.Port) api.Decision {
+	if l4M.Len() == 0 {
 		return api.Allowed
 	}
 
 	// Check L3-only filters first.
-	filter, match := l4[api.PortProtocolAny]
-	if match {
+	filter := l4M.ExactLookup("0", 0, "ANY")
+	if filter != nil {
 
 		matches, isDeny := filter.matchesLabels(labels)
 		switch {
@@ -1190,20 +1417,20 @@ func (l4 L4PolicyMap) containsAllL3L4(labels labels.LabelArray, ports []*models.
 		var isUDPDeny, isTCPDeny, isSCTPDeny bool
 		switch lwrProtocol {
 		case "", models.PortProtocolANY:
-			tcpPort := portStr + "/TCP"
-			tcpFilter, tcpmatch := l4[tcpPort]
+			tcpFilter := l4M.Lookup(portStr, "TCP")
+			tcpmatch := tcpFilter != nil
 			if tcpmatch {
 				tcpmatch, isTCPDeny = tcpFilter.matchesLabels(labels)
 			}
 
-			udpPort := portStr + "/UDP"
-			udpFilter, udpmatch := l4[udpPort]
+			udpFilter := l4M.Lookup(portStr, "UDP")
+			udpmatch := udpFilter != nil
 			if udpmatch {
 				udpmatch, isUDPDeny = udpFilter.matchesLabels(labels)
 			}
 
-			sctpPort := portStr + "/SCTP"
-			sctpFilter, sctpmatch := l4[sctpPort]
+			sctpFilter := l4M.Lookup(portStr, "SCTP")
+			sctpmatch := sctpFilter != nil
 			if sctpmatch {
 				sctpmatch, isSCTPDeny = sctpFilter.matchesLabels(labels)
 			}
@@ -1212,9 +1439,8 @@ func (l4 L4PolicyMap) containsAllL3L4(labels labels.LabelArray, ports []*models.
 				return api.Denied
 			}
 		default:
-			port := portStr + "/" + lwrProtocol
-			filter, match := l4[port]
-			if !match {
+			filter := l4M.Lookup(portStr, lwrProtocol)
+			if filter == nil {
 				return api.Denied
 			}
 			matches, isDeny := filter.matchesLabels(labels)
@@ -1406,16 +1632,16 @@ func (l4 *L4Policy) Attach(ctx PolicyContext) {
 // all `dPorts` and `labels`.
 //
 // Note: Only used for policy tracing
-func (l4 *L4PolicyMap) IngressCoversContext(ctx *SearchContext) api.Decision {
-	return l4.containsAllL3L4(ctx.From, ctx.DPorts)
+func (l4M *l4PolicyMap) IngressCoversContext(ctx *SearchContext) api.Decision {
+	return l4M.containsAllL3L4(ctx.From, ctx.DPorts)
 }
 
 // EgressCoversContext checks if the receiver's egress L4Policy contains
 // all `dPorts` and `labels`.
 //
 // Note: Only used for policy tracing
-func (l4 *L4PolicyMap) EgressCoversContext(ctx *SearchContext) api.Decision {
-	return l4.containsAllL3L4(ctx.To, ctx.DPorts)
+func (l4M *l4PolicyMap) EgressCoversContext(ctx *SearchContext) api.Decision {
+	return l4M.containsAllL3L4(ctx.To, ctx.DPorts)
 }
 
 // HasRedirect returns true if the L4 policy contains at least one port redirection
@@ -1439,7 +1665,7 @@ func (l4 *L4Policy) GetModel() *models.L4Policy {
 	}
 
 	ingress := []*models.PolicyRule{}
-	for _, v := range l4.Ingress.PortRules {
+	l4.Ingress.PortRules.ForEach(func(v *L4Filter) bool {
 		rulesBySelector := map[string][][]string{}
 		derivedFrom := labels.LabelArrayList{}
 		for sel, rules := range v.RuleOrigin {
@@ -1451,10 +1677,11 @@ func (l4 *L4Policy) GetModel() *models.L4Policy {
 			DerivedFromRules: derivedFrom.GetModel(),
 			RulesBySelector:  rulesBySelector,
 		})
-	}
+		return true
+	})
 
 	egress := []*models.PolicyRule{}
-	for _, v := range l4.Egress.PortRules {
+	l4.Egress.PortRules.ForEach(func(v *L4Filter) bool {
 		derivedFrom := labels.LabelArrayList{}
 		for _, rules := range v.RuleOrigin {
 			derivedFrom.MergeSorted(rules)
@@ -1463,7 +1690,8 @@ func (l4 *L4Policy) GetModel() *models.L4Policy {
 			Rule:             v.Marshal(),
 			DerivedFromRules: derivedFrom.GetModel(),
 		})
-	}
+		return true
+	})
 
 	return &models.L4Policy{
 		Ingress: ingress,

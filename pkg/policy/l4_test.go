@@ -261,14 +261,14 @@ func TestJSONMarshal(t *testing.T) {
 	require.EqualValues(t, "[]", pretty.Sprintf("%+ v", model.Ingress))
 
 	policy := L4Policy{
-		Egress: L4DirectionPolicy{PortRules: L4PolicyMap{
+		Egress: L4DirectionPolicy{PortRules: NewL4PolicyMap(map[string]*L4Filter{
 			"8080/TCP": {
 				Port:     8080,
 				Protocol: api.ProtoTCP,
 				Ingress:  false,
 			},
-		}},
-		Ingress: L4DirectionPolicy{PortRules: L4PolicyMap{
+		})},
+		Ingress: L4DirectionPolicy{PortRules: NewL4PolicyMap(map[string]*L4Filter{
 			"80/TCP": {
 				Port: 80, Protocol: api.ProtoTCP,
 				L7Parser: "http",
@@ -321,7 +321,7 @@ func TestJSONMarshal(t *testing.T) {
 				},
 				Ingress: true,
 			},
-		}},
+		})},
 	}
 
 	policy.Attach(td.testPolicyContext)

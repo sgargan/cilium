@@ -346,7 +346,7 @@ func (p *Repository) AllowsIngressRLocked(ctx *SearchContext) api.Decision {
 	}
 
 	verdict := api.Denied
-	if err == nil && len(ingressPolicy) > 0 {
+	if err == nil && ingressPolicy.Len() > 0 {
 		verdict = ingressPolicy.IngressCoversContext(ctx)
 	}
 
@@ -379,7 +379,7 @@ func (p *Repository) AllowsEgressRLocked(ctx *SearchContext) api.Decision {
 		log.WithError(err).Warn("Evaluation error while resolving L4 egress policy")
 	}
 	verdict := api.Denied
-	if err == nil && len(egressPolicy) > 0 {
+	if err == nil && egressPolicy.Len() > 0 {
 		verdict = egressPolicy.EgressCoversContext(ctx)
 	}
 

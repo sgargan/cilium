@@ -15,7 +15,7 @@ import (
 type ruleSlice []*rule
 
 func (rules ruleSlice) resolveL4IngressPolicy(policyCtx PolicyContext, ctx *SearchContext) (L4PolicyMap, error) {
-	result := L4PolicyMap{}
+	result := NewL4PolicyMap(nil)
 
 	ctx.PolicyTrace("\n")
 	ctx.PolicyTrace("Resolving ingress policy for %+v\n", ctx.To)
@@ -65,7 +65,7 @@ func (rules ruleSlice) resolveL4IngressPolicy(policyCtx PolicyContext, ctx *Sear
 }
 
 func (rules ruleSlice) resolveL4EgressPolicy(policyCtx PolicyContext, ctx *SearchContext) (L4PolicyMap, error) {
-	result := L4PolicyMap{}
+	result := NewL4PolicyMap(nil)
 
 	ctx.PolicyTrace("\n")
 	ctx.PolicyTrace("Resolving egress policy for %+v\n", ctx.From)
