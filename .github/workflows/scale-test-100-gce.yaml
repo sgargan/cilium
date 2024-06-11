@@ -241,6 +241,10 @@ jobs:
         run: |
           cilium status --wait --wait-duration=20m
 
+      - name: (debug) check rate limit
+        run: |
+          kubectl -n kube-system logs -l name=cilium-operator --tail -1 | grep 'CES controller workqueue configuration'
+
       - name: Run CL2
         id: run-cl2
         working-directory: ./perf-tests/clusterloader2
