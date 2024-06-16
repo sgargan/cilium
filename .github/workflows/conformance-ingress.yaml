@@ -191,9 +191,9 @@ jobs:
         with:
           # Use the forked repo with retry mechanism
           # Please refer to https://github.com/kubernetes-sigs/ingress-controller-conformance/pull/101 for more details.
-          repository: cilium/ingress-controller-conformance
+          repository: sayboras/ingress-controller-conformance
           path: ingress-controller-conformance
-          ref: 010bbae21b71d9785660b87908dfe2ba8cd2f25d
+          ref: 4e0560fde2583ae3e0cb042c6ecd7c7028f45db5
           persist-credentials: false
 
       - name: Install Ingress conformance test tool
